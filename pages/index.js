@@ -6,16 +6,120 @@ export default function IronCoach() {
   const [selectedWorkout, setSelectedWorkout] = useState(null);
   const [countdown, setCountdown] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState('');
+  const [dragOver, setDragOver] = useState(false);
   const [viewMode, setViewMode] = useState('timeline'); // 'timeline' or 'calendar'
   const [feedbackExpanded, setFeedbackExpanded] = useState({});
   const [readiness, setReadiness] = useState({
-    swim: 3,
-    bike: 5,
-    run: 6
+    swim: null,
+    bike: null,
+    run: null
   });
   
-  const raceDate = new Date(Date.UTC(2026, 1, 14, 6, 0, 0)); // Feb 14, 2026 at 6am UTC
+  // Claude chat state
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [claudeAnalysis, setClaudeAnalysis] = useState(null);
+  
+  // NEW: Athlete configuration
+  const [athleteConfig, setAthleteConfig] = useState({
+    ftp: 190,
+    weight: 72,
+    runThresholdPace: 300, // 5:00/km in seconds
+    swimCSS: 180, // 3:00/100m in seconds
+    raceTargets: {
+      swimCutoff: 70,
+      swimTarget: 50,
+      bikeTarget: 225, // 3:45
+      bikePower: 160,
+      runTarget: 120,
+      runPace: 340 // 5:40/km
+    }
+  });
+  const [showSettings, setShowSettings] = useState(false);
+  
+  // NEW: Prescription context modal
+  const [prescriptionModal, setPrescriptionModal] = useState({
+    open: false,
+    workout: null,
+    queue: []
+  });
+  
+  const raceDate = new Date(Date.UTC(2026, 1, 14, 6, 0, 0));
 
+// Calculate readiness scores from workout data
+  useEffect(() => {
+    if (workouts.length === 0) return;
+    
+    const sixWeeksAgo = new Date();
+    sixWeeksAgo.setDate(sixWeeksAgo.getDate() - 42);
+    const recent = workouts.filter(w => new Date(w.date) > sixWeeksAgo);
+    
+    // SWIM readiness
+    const swims = recent.filter(w => w.sport === 'swim');
+    let swimScore = 0;
+    if (swims.length > 0) {
+      const avgProjected = swims.reduce((sum, w) => {
+        return sum + (w.analysis?.projectedRaceSwim || 70);
+      }, 0) / swims.length;
+      
+      if (avgProjected < 50) swimScore = 9;
+      else if (avgProjected < 55) swimScore = 7;
+      else if (avgProjected < 60) swimScore = 5;
+      else if (avgProjected < 65) swimScore = 3;
+      else swimScore = 1;
+      
+      // Volume bonus
+      if (swims.length >= 3) swimScore = Math.min(10, swimScore + 1);
+    }
+    
+    // BIKE readiness
+    const bikes = recent.filter(w => w.sport === 'bike');
+    let bikeScore = 0;
+    if (bikes.length > 0) {
+      const avgVI = bikes.reduce((sum, w) => {
+        return sum + (w.analysis?.variabilityIndex || 1.1);
+      }, 0) / bikes.length;
+      
+      if (avgVI < 1.03) bikeScore = 9;
+      else if (avgVI < 1.05) bikeScore = 7;
+      else if (avgVI < 1.08) bikeScore = 5;
+      else if (avgVI < 1.10) bikeScore = 3;
+      else bikeScore = 1;
+      
+      // Long ride bonus (>2hr)
+      const hasLongRide = bikes.some(w => w.durationMinutes > 120);
+      if (hasLongRide) bikeScore = Math.min(10, bikeScore + 1);
+    }
+    
+    // RUN readiness
+    const runs = recent.filter(w => w.sport === 'run');
+    let runScore = 0;
+    if (runs.length > 0) {
+      const avgDrift = runs.reduce((sum, w) => {
+        return sum + Math.abs(w.analysis?.hrDrift || 15);
+      }, 0) / runs.length;
+      
+      if (avgDrift < 8) runScore = 9;
+      else if (avgDrift < 12) runScore = 7;
+      else if (avgDrift < 15) runScore = 5;
+      else if (avgDrift < 20) runScore = 3;
+      else runScore = 1;
+      
+      // Long run bonus (>75min)
+      const hasLongRun = runs.some(w => w.durationMinutes > 75);
+      if (hasLongRun) runScore = Math.min(10, runScore + 1);
+    }
+    
+    setReadiness({
+      swim: swimScore > 0 ? swimScore : null,
+      bike: bikeScore > 0 ? bikeScore : null,
+      run: runScore > 0 ? runScore : null
+    });
+  }, [workouts]);
+
+  // Countdown timer
   useEffect(() => {
     updateCountdown();
     const interval = setInterval(updateCountdown, 60000);
@@ -42,14 +146,21 @@ export default function IronCoach() {
     if (files.length === 0) return;
 
     setUploading(true);
+    setUploadProgress('Preparing files...');
 
     const newWorkouts = [];
     
-    for (const file of files) {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      setUploadProgress(`Reading ${file.name}...`);
+      
       const formData = new FormData();
       formData.append('file', file);
+      formData.append('athleteConfig', JSON.stringify(athleteConfig));
 
       try {
+        setUploadProgress(`Analyzing ${file.name}...`);
+        
         const response = await fetch('/api/parse-fit', {
           method: 'POST',
           body: formData,
@@ -62,23 +173,182 @@ export default function IronCoach() {
             filename: file.name,
             ...data
           });
+          setUploadProgress(`✓ Analyzed ${file.name}`);
         }
       } catch (error) {
         console.error('Error parsing file:', error);
+        setUploadProgress(`✗ Failed to analyze ${file.name}`);
       }
+      
+      // Brief pause to show progress
+      await new Promise(resolve => setTimeout(resolve, 300));
     }
 
-    const updated = [...workouts, ...newWorkouts].sort((a, b) => 
-      new Date(b.date) - new Date(a.date)
-    );
-    setWorkouts(updated);
-    
-    if (updated.length > 0 && !selectedWorkout) {
-      setSelectedWorkout(updated[0]);
+    // Show prescription modal for new workouts
+    if (newWorkouts.length > 0) {
+      setPrescriptionModal({
+        open: true,
+        workout: newWorkouts[0],
+        queue: newWorkouts.slice(1)
+      });
     }
 
     setUploading(false);
+    setUploadProgress('');
     event.target.value = '';
+  };
+
+  // NEW: Handle prescription save
+  const savePrescription = (prescription) => {
+    const workoutWithPrescription = {
+      ...prescriptionModal.workout,
+      prescription
+    };
+    
+    const updated = [...workouts, workoutWithPrescription].sort((a, b) => 
+      new Date(b.date) - new Date(a.date)
+    );
+    setWorkouts(updated);
+    setSelectedWorkout(workoutWithPrescription);
+    
+    // Process queue
+    if (prescriptionModal.queue.length > 0) {
+      setPrescriptionModal({
+        open: true,
+        workout: prescriptionModal.queue[0],
+        queue: prescriptionModal.queue.slice(1)
+      });
+    } else {
+      setPrescriptionModal({ open: false, workout: null, queue: [] });
+      // Get Claude analysis after prescription is saved
+      setTimeout(() => getClaudeAnalysis(workoutWithPrescription), 300);
+    }
+  };
+
+  const skipPrescription = () => {
+    const workout = prescriptionModal.workout;
+    const updated = [...workouts, workout].sort((a, b) => 
+      new Date(b.date) - new Date(a.date)
+    );
+    setWorkouts(updated);
+    setSelectedWorkout(workout);
+    
+    if (prescriptionModal.queue.length > 0) {
+      setPrescriptionModal({
+        open: true,
+        workout: prescriptionModal.queue[0],
+        queue: prescriptionModal.queue.slice(1)
+      });
+    } else {
+      setPrescriptionModal({ open: false, workout: null, queue: [] });
+    }
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    
+    const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith('.fit'));
+    if (files.length > 0) {
+      // Simulate file input event
+      handleFileUpload({ target: { files } });
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  };
+
+  const getClaudeAnalysis = async (workout) => {
+    if (!workout) return;
+    
+    setIsAnalyzing(true);
+    setChatMessages([]);
+    setClaudeAnalysis(null);
+    
+    try {
+      const response = await fetch('/api/analyze-workout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          workout,
+          athleteConfig,
+          prescription: workout.prescription
+        })
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Analysis failed');
+      }
+      
+      const data = await response.json();
+      setClaudeAnalysis(data.analysis);
+      
+      // Add to chat history
+      setChatMessages([{
+        role: 'assistant',
+        content: data.analysis
+      }]);
+      
+    } catch (error) {
+      console.error('Claude analysis error:', error);
+      setClaudeAnalysis(`Error: ${error.message}\n\nMake sure ANTHROPIC_API_KEY is set in Vercel environment variables.`);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const sendChatMessage = async () => {
+    if (!chatInput.trim() || isAnalyzing) return;
+    
+    const userMessage = chatInput.trim();
+    setChatInput('');
+    
+    // Add user message to chat
+    const newMessages = [...chatMessages, { role: 'user', content: userMessage }];
+    setChatMessages(newMessages);
+    setIsAnalyzing(true);
+    
+    try {
+      const response = await fetch('/api/analyze-workout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          message: userMessage,
+          conversationHistory: newMessages
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error('Chat request failed');
+      }
+      
+      const data = await response.json();
+      
+      setChatMessages([...newMessages, {
+        role: 'assistant',
+        content: data.analysis
+      }]);
+      
+    } catch (error) {
+      console.error('Chat error:', error);
+      setChatMessages([...newMessages, {
+        role: 'assistant',
+        content: `Error: ${error.message}`
+      }]);
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   const renderTimeline = () => {
@@ -187,7 +457,7 @@ export default function IronCoach() {
 
   const renderHRChart = (workout) => {
     const avgHR = workout.analysis.avgHR || 140;
-    const driftAmount = 12; // This should come from actual analysis
+    const driftAmount = workout.analysis.hrDrift || 0; // Use actual drift from parser
     
     return (
       <div className="chart-container">
@@ -267,25 +537,37 @@ export default function IronCoach() {
     if (!dist) return null;
 
     const avgPower = workout.analysis.avgPower || 0;
-    const targetPower = 180; // Should be user's FTP * 0.85 for Ironman
+    const targetPower = athleteConfig.raceTargets.bikePower; // Race target power
+    const ftp = athleteConfig.ftp;
+    
+    // Calculate zone boundaries from FTP
+    const z1Max = Math.round(ftp * 0.55);
+    const z2Max = Math.round(ftp * 0.75);
+    const z3Max = Math.round(ftp * 0.90);
+    const z4Max = Math.round(ftp * 1.05);
+    
+    // Use boundaries from API if available, otherwise calculate
+    const bounds = workout.analysis.powerZoneBoundaries || {
+      z1: z1Max, z2: z2Max, z3: z3Max, z4: z4Max
+    };
     
     return (
       <div className="chart-container">
         <div className="chart-title">
           Where You Spent Your Energy
-          {dist.z4 > 15 && <span className="chart-annotation">⚠ Too many hard efforts</span>}
+          {(dist.z5 || 0) + (dist.z6 || 0) > 10 && <span className="chart-annotation">⚠ Too much time above FTP</span>}
         </div>
         <div className="power-zones-chart">
           <div className="power-zone-bar">
-            <div className="power-zone-label">&lt;120W (Easy spinning)</div>
+            <div className="power-zone-label">&lt;{bounds.z1}W (Recovery)</div>
             <div className="power-zone-track">
-              <div className="power-zone-fill" style={{ width: `${Math.min(dist.z1, 100)}%` }}>
+              <div className="power-zone-fill" style={{ width: `${Math.min(dist.z1, 100)}%`, background: 'linear-gradient(90deg, #95a5a6, #7f8c8d)' }}>
                 {dist.z1 > 5 && <span className="power-zone-value">{dist.z1.toFixed(1)}%</span>}
               </div>
             </div>
           </div>
           <div className="power-zone-bar">
-            <div className="power-zone-label">120-150W (Comfortable pace)</div>
+            <div className="power-zone-label">{bounds.z1}-{bounds.z2}W (Endurance)</div>
             <div className="power-zone-track">
               <div className="power-zone-fill" style={{ width: `${Math.min(dist.z2, 100)}%`, background: 'linear-gradient(90deg, #2ecc71, #27ae60)' }}>
                 {dist.z2 > 5 && <span className="power-zone-value">{dist.z2.toFixed(1)}%</span>}
@@ -293,7 +575,7 @@ export default function IronCoach() {
             </div>
           </div>
           <div className="power-zone-bar">
-            <div className="power-zone-label">150-190W (Race pace)</div>
+            <div className="power-zone-label">{bounds.z2}-{bounds.z3}W (Tempo)</div>
             <div className="power-zone-track">
               <div className="power-zone-fill" style={{ width: `${Math.min(dist.z3, 100)}%`, background: 'linear-gradient(90deg, #f39c12, #e67e22)' }}>
                 {dist.z3 > 5 && <span className="power-zone-value">{dist.z3.toFixed(1)}%</span>}
@@ -301,20 +583,28 @@ export default function IronCoach() {
             </div>
           </div>
           <div className="power-zone-bar">
-            <div className="power-zone-label">&gt;190W (Too hard)</div>
+            <div className="power-zone-label">{bounds.z3}-{bounds.z4}W (Threshold)</div>
             <div className="power-zone-track">
               <div className="power-zone-fill" style={{ width: `${Math.min(dist.z4, 100)}%`, background: 'linear-gradient(90deg, #e74c3c, #c0392b)' }}>
                 {dist.z4 > 5 && <span className="power-zone-value">{dist.z4.toFixed(1)}%</span>}
               </div>
             </div>
           </div>
+          <div className="power-zone-bar">
+            <div className="power-zone-label">&gt;{bounds.z4}W (Above FTP)</div>
+            <div className="power-zone-track">
+              <div className="power-zone-fill" style={{ width: `${Math.min((dist.z5 || 0) + (dist.z6 || 0), 100)}%`, background: 'linear-gradient(90deg, #9b59b6, #8e44ad)' }}>
+                {((dist.z5 || 0) + (dist.z6 || 0)) > 5 && <span className="power-zone-value">{((dist.z5 || 0) + (dist.z6 || 0)).toFixed(1)}%</span>}
+              </div>
+            </div>
+          </div>
         </div>
         <div className="chart-insight" dangerouslySetInnerHTML={{
-          __html: dist.z4 > 15 
-            ? `You spent ${dist.z4.toFixed(0)}% of this ride pushing hard (>190W). In a 90km race, this will destroy your run. <strong>Fix:</strong> Next 3 rides, set your bike computer to beep if power goes above 190W. Stay between 170-190W for the entire ride, even on hills.`
-            : dist.z1 + dist.z2 > 60
-            ? `You're riding too easy - ${(dist.z1 + dist.z2).toFixed(0)}% below race pace. <strong>Fix:</strong> Next ride, hold 180W steady for 45 minutes. Don't let it drop below 175W.`
-            : `Good power distribution. You're riding at race pace (150-190W) without burning matches with hard surges.`
+          __html: ((dist.z5 || 0) + (dist.z6 || 0)) > 10 
+            ? `You spent ${((dist.z5 || 0) + (dist.z6 || 0)).toFixed(0)}% above FTP (>${ftp}W). For a 90km race, this burns matches you need for the run. <strong>Fix:</strong> Set your bike computer to alert above ${bounds.z4}W. Practice holding ${targetPower}W steady on climbs.`
+            : dist.z1 + dist.z2 > 70
+            ? `${(dist.z1 + dist.z2).toFixed(0)}% in Z1-Z2 - fine for recovery/easy rides. For race-specific work, aim for more time at ${targetPower}W.`
+            : `Good power distribution for triathlon. Spending time in Z2-Z3 (${bounds.z1}-${bounds.z3}W) builds the aerobic engine you need.`
         }} />
       </div>
     );
@@ -536,6 +826,44 @@ export default function IronCoach() {
   return (
     <>
       <style jsx global>{`
+        :root {
+          /* Brand Colors - Ocean Blue/Cyan Palette */
+          --primary: #3498DB;
+          --primary-dark: #2980B9;
+          --primary-light: #5DADE2;
+          --secondary: #1ABC9C;
+          --secondary-dark: #16A085;
+          --accent: #34495E;
+          
+          /* Text Colors */
+          --text-primary: #2C3E50;
+          --text-secondary: #7F8C8D;
+          --text-light: #95A5A6;
+          
+          /* Background Colors */
+          --bg-primary: #FFFFFF;
+          --bg-secondary: #F8F9FA;
+          --bg-tertiary: #ECF0F1;
+          
+          /* Status Colors */
+          --success: #27AE60;
+          --warning: #F39C12;
+          --danger: #E74C3C;
+          
+          /* Sport Colors */
+          --swim: #3498DB;
+          --bike: #E67E22;
+          --run: #E74C3C;
+          
+          /* UI Elements */
+          --border: #E0E0E0;
+          --border-light: #EFEFEF;
+          --shadow-sm: 0 2px 4px rgba(52, 152, 219, 0.08);
+          --shadow-md: 0 4px 8px rgba(52, 152, 219, 0.12);
+          --shadow-lg: 0 8px 16px rgba(52, 152, 219, 0.16);
+          --shadow-hover: 0 12px 24px rgba(52, 152, 219, 0.2);
+        }
+
         * {
           margin: 0;
           padding: 0;
@@ -543,22 +871,40 @@ export default function IronCoach() {
         }
 
         body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-          background: #f5f5f5;
-          color: #333;
+          font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+          background: var(--bg-secondary);
+          color: var(--text-primary);
+        }
+
+        /* Smooth transitions for interactive elements */
+        button, a, .card, .workout-card, .metric-card {
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         .header {
-          background: #1a1a1a;
+          background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary) 100%);
           color: white;
-          padding: 1rem 2rem;
-          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+          padding: 1.25rem 2rem;
+          box-shadow: var(--shadow-md);
+          position: relative;
         }
 
         .header h1 {
           font-size: 1.5rem;
-          font-weight: 600;
+          font-weight: 700;
           margin: 0;
+          letter-spacing: -0.02em;
+          display: flex;
+          align-items: center;
+          gap: 0.75rem;
+        }
+
+        .header h1::before {
+          content: "🏊‍♂️";
+          font-size: 1.75rem;
+          filter: drop-shadow(0 2px 4px rgba(0,0,0,0.15));
         }
 
         .hero-section {
@@ -592,8 +938,9 @@ export default function IronCoach() {
 
         .countdown-separator {
           font-size: 2rem;
-          color: #333;
+          color: var(--text-secondary);
           font-weight: 300;
+          opacity: 0.6;
         }
 
         .countdown-unit {
@@ -604,19 +951,22 @@ export default function IronCoach() {
 
         .countdown-number {
           font-size: 3rem;
-          font-weight: 700;
+          font-weight: 800;
           line-height: 1;
-          color: #333;
-          font-family: 'Courier New', monospace;
+          background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+          font-family: 'JetBrains Mono', 'Courier New', monospace;
         }
 
         .countdown-label-small {
           font-size: 0.65rem;
-          color: #888;
+          color: var(--text-secondary);
           text-transform: uppercase;
-          letter-spacing: 1px;
+          letter-spacing: 0.1em;
           margin-top: 0.25rem;
-          font-weight: 600;
+          font-weight: 700;
         }
 
         .readiness-grid {
@@ -626,54 +976,64 @@ export default function IronCoach() {
         }
 
         .readiness-card {
-          background: white;
-          border: 2px solid #e0e0e0;
-          border-radius: 8px;
+          background: var(--bg-primary);
+          border: 2px solid var(--border);
+          border-radius: 12px;
           padding: 1rem 1.25rem;
           min-width: 120px;
+          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+          box-shadow: var(--shadow-sm);
+        }
+
+        .readiness-card:hover {
+          transform: translateY(-4px);
+          box-shadow: var(--shadow-lg);
+          border-color: var(--primary);
         }
 
         .readiness-icon {
-          font-size: 1.5rem;
-          margin-bottom: 0.25rem;
+          font-size: 1.75rem;
+          margin-bottom: 0.5rem;
+          filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1));
         }
 
         .readiness-sport {
           font-size: 0.7rem;
-          color: #888;
+          color: var(--text-secondary);
           margin-bottom: 0.5rem;
           text-transform: uppercase;
-          letter-spacing: 1px;
-          font-weight: 600;
+          letter-spacing: 0.1em;
+          font-weight: 700;
         }
 
         .readiness-score {
           font-size: 2rem;
-          font-weight: 700;
+          font-weight: 800;
           margin-bottom: 0.5rem;
-          color: #333;
-          font-family: 'Courier New', monospace;
+          color: var(--text-primary);
+          font-family: 'JetBrains Mono', 'Courier New', monospace;
         }
 
         .readiness-bar {
-          height: 4px;
-          background: #e0e0e0;
-          border-radius: 2px;
+          height: 6px;
+          background: var(--bg-tertiary);
+          border-radius: 3px;
           overflow: hidden;
-          margin-bottom: 0.4rem;
+          margin-bottom: 0.5rem;
         }
 
         .readiness-fill {
           height: 100%;
-          background: #333;
-          border-radius: 2px;
-          transition: width 0.6s ease;
+          background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
+          border-radius: 3px;
+          transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+          box-shadow: 0 0 8px rgba(52, 152, 219, 0.4);
         }
 
         .readiness-label {
-          font-size: 0.65rem;
-          color: #666;
-          font-weight: 500;
+          font-size: 0.7rem;
+          color: var(--text-secondary);
+          font-weight: 600;
         }
 
         .main-container {
@@ -709,26 +1069,125 @@ export default function IronCoach() {
           margin-bottom: 2rem;
         }
 
+        .upload-section h2 {
+          font-size: 1rem;
+          margin-bottom: 1rem;
+          font-weight: 600;
+        }
+
+        .upload-dropzone {
+          border: 2px dashed var(--border);
+          border-radius: 12px;
+          padding: 2rem 1rem;
+          text-align: center;
+          cursor: pointer;
+          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+          background: var(--bg-primary);
+        }
+
+        .upload-dropzone:hover {
+          border-color: var(--primary);
+          background: var(--bg-tertiary);
+          transform: scale(1.01);
+        }
+
+        .upload-dropzone.drag-over {
+          border-color: var(--primary);
+          background: linear-gradient(135deg, rgba(52, 152, 219, 0.05) 0%, rgba(26, 188, 156, 0.05) 100%);
+          border-width: 3px;
+          box-shadow: var(--shadow-md);
+        }
+
+        .upload-dropzone-icon {
+          font-size: 2.5rem;
+          margin-bottom: 0.5rem;
+          opacity: 0.6;
+          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .upload-dropzone:hover .upload-dropzone-icon {
+          opacity: 0.9;
+          transform: scale(1.1);
+        }
+
+        .upload-dropzone.drag-over .upload-dropzone-icon {
+          opacity: 1;
+          transform: scale(1.2);
+          filter: drop-shadow(0 4px 8px rgba(52, 152, 219, 0.3));
+        }
+
+        .upload-dropzone-text {
+          font-size: 0.9rem;
+          color: #666;
+          margin-bottom: 0.25rem;
+          font-weight: 600;
+        }
+
+        .upload-dropzone-subtext {
+          font-size: 0.75rem;
+          color: #999;
+        }
+
+        .upload-progress {
+          margin-top: 1rem;
+          padding: 1rem;
+          background: #e3f2fd;
+          border-radius: 6px;
+          font-size: 0.85rem;
+          color: #1976d2;
+          font-weight: 500;
+        }
+
+        .upload-progress-bar {
+          height: 4px;
+          background: #ddd;
+          border-radius: 2px;
+          overflow: hidden;
+          margin-top: 0.5rem;
+        }
+
+        .upload-progress-fill {
+          height: 100%;
+          background: #3498db;
+          transition: width 0.3s;
+          animation: progress-pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes progress-pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+
         .upload-btn {
           width: 100%;
           padding: 0.75rem;
-          background: #3498db;
+          background: var(--primary);
           color: white;
           border: none;
-          border-radius: 4px;
+          border-radius: 8px;
           cursor: pointer;
           font-weight: 600;
           margin-bottom: 0.5rem;
           font-size: 1rem;
+          box-shadow: var(--shadow-sm);
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
-        .upload-btn:hover {
-          background: #2980b9;
+        .upload-btn:hover:not(:disabled) {
+          background: var(--primary-dark);
+          transform: translateY(-1px);
+          box-shadow: var(--shadow-md);
+        }
+
+        .upload-btn:active:not(:disabled) {
+          transform: translateY(0);
+          box-shadow: var(--shadow-sm);
         }
 
         .upload-btn:disabled {
-          background: #95a5a6;
+          background: var(--text-light);
           cursor: not-allowed;
+          transform: none;
         }
 
         .upload-help {
@@ -744,46 +1203,69 @@ export default function IronCoach() {
         .workout-item {
           padding: 0.75rem;
           margin-bottom: 0.5rem;
-          background: #f8f9fa;
-          border-radius: 4px;
+          background: var(--bg-primary);
+          border-radius: 8px;
           cursor: pointer;
           border-left: 4px solid transparent;
-          transition: all 0.2s;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+          box-shadow: var(--shadow-sm);
         }
 
         .workout-item:hover {
-          background: #e9ecef;
+          background: var(--bg-tertiary);
+          transform: translateX(4px);
+          box-shadow: var(--shadow-md);
         }
 
         .workout-item.active {
-          background: #e3f2fd;
-          border-left-color: #3498db;
+          background: var(--bg-primary);
+          box-shadow: var(--shadow-lg);
+          transform: translateX(4px);
         }
 
-        .workout-item.swim { border-left-color: #3498db; }
-        .workout-item.bike { border-left-color: #e67e22; }
-        .workout-item.run { border-left-color: #e74c3c; }
+        .workout-item.swim { 
+          border-left-color: var(--swim);
+        }
+        .workout-item.swim.active {
+          background: linear-gradient(90deg, rgba(52, 152, 219, 0.05) 0%, transparent 100%);
+        }
+
+        .workout-item.bike { 
+          border-left-color: var(--bike);
+        }
+        .workout-item.bike.active {
+          background: linear-gradient(90deg, rgba(230, 126, 34, 0.05) 0%, transparent 100%);
+        }
+
+        .workout-item.run { 
+          border-left-color: var(--run);
+        }
+        .workout-item.run.active {
+          background: linear-gradient(90deg, rgba(231, 76, 60, 0.05) 0%, transparent 100%);
+        }
 
         .workout-sport {
           font-size: 0.75rem;
-          font-weight: 600;
+          font-weight: 700;
           text-transform: uppercase;
           margin-bottom: 0.25rem;
+          letter-spacing: 0.05em;
         }
 
-        .workout-sport.swim { color: #3498db; }
-        .workout-sport.bike { color: #e67e22; }
-        .workout-sport.run { color: #e74c3c; }
+        .workout-sport.swim { color: var(--swim); }
+        .workout-sport.bike { color: var(--bike); }
+        .workout-sport.run { color: var(--run); }
 
         .workout-date {
           font-size: 0.85rem;
-          color: #666;
+          color: var(--text-secondary);
           margin-bottom: 0.25rem;
+          font-weight: 500;
         }
 
         .workout-details {
           font-size: 0.8rem;
-          color: #888;
+          color: var(--text-light);
         }
 
         .calendar-section {
@@ -1152,10 +1634,18 @@ export default function IronCoach() {
         }
 
         .metric-card {
-          background: #f8f9fa;
+          background: var(--bg-primary);
           padding: 1rem;
-          border-radius: 4px;
+          border-radius: 12px;
           position: relative;
+          border: 1px solid var(--border-light);
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .metric-card:hover {
+          border-color: var(--primary);
+          box-shadow: var(--shadow-md);
+          transform: translateY(-2px);
         }
 
         .metric-card-top {
@@ -1167,7 +1657,10 @@ export default function IronCoach() {
 
         .metric-label {
           font-size: 0.8rem;
-          color: #666;
+          color: var(--text-secondary);
+          font-weight: 600;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
         }
 
         .metric-sparkline {
@@ -1176,29 +1669,166 @@ export default function IronCoach() {
         }
 
         .metric-value {
-          font-size: 1.5rem;
-          font-weight: 600;
-          color: #333;
+          font-size: 1.75rem;
+          font-weight: 700;
+          color: var(--text-primary);
+          font-family: 'JetBrains Mono', 'Courier New', monospace;
+        }
+
+        .metric-unit {
+          font-size: 0.9rem;
+          font-weight: 500;
+          color: var(--text-secondary);
+          margin-left: 0.25rem;
         }
 
         .metric-trend {
           font-size: 0.75rem;
-          margin-top: 0.25rem;
+          margin-top: 0.5rem;
           display: flex;
           align-items: center;
           gap: 0.25rem;
+          font-weight: 600;
         }
 
         .metric-trend.up {
-          color: #27ae60;
+          color: var(--success);
         }
 
         .metric-trend.down {
+          color: var(--danger);
+        }
+
+        .metric-trend.neutral {
+          color: var(--text-light);
+        }
           color: #e74c3c;
         }
 
         .metric-trend.neutral {
           color: #999;
+        }
+
+        .claude-analysis-section {
+          background: white;
+          border-radius: 8px;
+          padding: 1.5rem;
+          margin-bottom: 2rem;
+        }
+
+        .claude-analysis-header {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+          margin-bottom: 1rem;
+          font-weight: 600;
+          color: #333;
+        }
+
+        .claude-analysis-content {
+          line-height: 1.6;
+          color: #444;
+          white-space: pre-wrap;
+        }
+
+        .claude-analyzing {
+          color: #999;
+          font-style: italic;
+        }
+
+        .chat-section {
+          background: #f8f9fa;
+          border-radius: 8px;
+          padding: 1rem;
+          margin-top: 2rem;
+        }
+
+        .chat-header {
+          font-weight: 600;
+          margin-bottom: 1rem;
+          color: #333;
+        }
+
+        .chat-messages {
+          max-height: 300px;
+          overflow-y: auto;
+          margin-bottom: 1rem;
+          display: flex;
+          flex-direction: column;
+          gap: 1rem;
+        }
+
+        .chat-message {
+          padding: 0.875rem 1rem;
+          border-radius: 12px;
+          line-height: 1.6;
+          transition: all 0.2s ease;
+        }
+
+        .chat-message.user {
+          background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+          color: white;
+          align-self: flex-end;
+          max-width: 80%;
+          box-shadow: var(--shadow-sm);
+        }
+
+        .chat-message.assistant {
+          background: var(--bg-primary);
+          border: 1px solid var(--border);
+          color: var(--text-primary);
+          align-self: flex-start;
+          max-width: 90%;
+          white-space: pre-wrap;
+          box-shadow: var(--shadow-sm);
+        }
+
+        .chat-input-container {
+          display: flex;
+          gap: 0.5rem;
+        }
+
+        .chat-input {
+          flex: 1;
+          padding: 0.875rem 1rem;
+          border: 2px solid var(--border);
+          border-radius: 12px;
+          font-size: 0.9rem;
+          transition: all 0.2s ease;
+          background: var(--bg-primary);
+        }
+
+        .chat-input:focus {
+          outline: none;
+          border-color: var(--primary);
+          box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+
+        .chat-send-btn {
+          padding: 0.875rem 1.75rem;
+          background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+          color: white;
+          border: none;
+          border-radius: 12px;
+          cursor: pointer;
+          font-weight: 700;
+          transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+          box-shadow: var(--shadow-sm);
+        }
+
+        .chat-send-btn:hover:not(:disabled) {
+          transform: translateY(-2px);
+          box-shadow: var(--shadow-md);
+        }
+
+        .chat-send-btn:active:not(:disabled) {
+          transform: translateY(0);
+        }
+
+        .chat-send-btn:disabled {
+          background: var(--text-light);
+          cursor: not-allowed;
+          transform: none;
         }
 
         .metric-unit {
@@ -1409,11 +2039,208 @@ export default function IronCoach() {
           font-weight: 600;
           margin-bottom: 0.25rem;
         }
+
+        /* Settings button */
+        .settings-btn {
+          position: absolute;
+          right: 2rem;
+          top: 50%;
+          transform: translateY(-50%);
+          background: rgba(255,255,255,0.15);
+          border: none;
+          padding: 0.5rem 0.75rem;
+          border-radius: 8px;
+          font-size: 1.25rem;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        .settings-btn:hover {
+          background: rgba(255,255,255,0.25);
+        }
+
+        /* Modal styles */
+        .modal-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0,0,0,0.6);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+          backdrop-filter: blur(4px);
+        }
+        
+        .modal-content {
+          background: white;
+          border-radius: 16px;
+          padding: 2rem;
+          max-width: 500px;
+          width: 90%;
+          max-height: 90vh;
+          overflow-y: auto;
+          box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
+        }
+        
+        .modal-content h2 {
+          font-size: 1.5rem;
+          margin-bottom: 0.5rem;
+        }
+        
+        .modal-subtitle {
+          color: #666;
+          margin-bottom: 1.5rem;
+          font-size: 0.9rem;
+        }
+        
+        .settings-section {
+          margin-bottom: 1.5rem;
+          padding-bottom: 1.5rem;
+          border-bottom: 1px solid #eee;
+        }
+        
+        .settings-section:last-of-type {
+          border-bottom: none;
+        }
+        
+        .settings-section h3 {
+          font-size: 0.85rem;
+          color: #666;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          margin-bottom: 1rem;
+        }
+        
+        .settings-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 0.75rem;
+        }
+        
+        .settings-row label {
+          font-size: 0.9rem;
+        }
+        
+        .settings-input-group {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+        }
+        
+        .settings-input-group input {
+          width: 80px;
+          padding: 0.5rem;
+          border: 1px solid #ddd;
+          border-radius: 6px;
+          text-align: right;
+          font-size: 0.9rem;
+        }
+        
+        .settings-input-group input:focus {
+          outline: none;
+          border-color: var(--primary);
+          box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+        
+        .settings-input-group span {
+          color: #666;
+          font-size: 0.85rem;
+          width: 40px;
+        }
+        
+        .workout-preview {
+          display: flex;
+          gap: 1rem;
+          padding: 1rem;
+          background: #f5f5f5;
+          border-radius: 8px;
+          margin-bottom: 1.5rem;
+          font-size: 0.9rem;
+        }
+        
+        .prescription-form .form-group {
+          margin-bottom: 1rem;
+        }
+        
+        .prescription-form label {
+          display: block;
+          font-size: 0.85rem;
+          color: #666;
+          margin-bottom: 0.5rem;
+        }
+        
+        .prescription-form input {
+          width: 100%;
+          padding: 0.75rem;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          font-size: 0.9rem;
+        }
+        
+        .prescription-form input:focus {
+          outline: none;
+          border-color: var(--primary);
+          box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+        
+        .queue-indicator {
+          text-align: center;
+          color: #666;
+          font-size: 0.85rem;
+          margin-bottom: 1rem;
+          padding: 0.5rem;
+          background: #f0f0f0;
+          border-radius: 6px;
+        }
+        
+        .modal-actions {
+          display: flex;
+          gap: 1rem;
+          margin-top: 1.5rem;
+        }
+        
+        .btn-primary {
+          flex: 1;
+          padding: 0.75rem 1.5rem;
+          background: var(--primary);
+          color: white;
+          border: none;
+          border-radius: 8px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        
+        .btn-primary:hover {
+          background: var(--primary-dark);
+          transform: translateY(-1px);
+        }
+        
+        .btn-secondary {
+          padding: 0.75rem 1.5rem;
+          background: transparent;
+          color: #666;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        
+        .btn-secondary:hover {
+          background: #f5f5f5;
+        }
       `}</style>
 
       <div className="main-container">
         <div className="header">
           <h1>🏊‍♂️ IronCoach</h1>
+          <button 
+            className="settings-btn"
+            onClick={() => setShowSettings(true)}
+            title="Settings"
+          >
+            ⚙️
+          </button>
         </div>
 
         <div className="hero-section">
@@ -1441,36 +2268,36 @@ export default function IronCoach() {
               <div className="readiness-card">
                 <div className="readiness-icon">🏊‍♂️</div>
                 <div className="readiness-sport">Swim</div>
-                <div className="readiness-score">{readiness.swim}/10</div>
+                <div className="readiness-score">{readiness.swim !== null ? `${readiness.swim}/10` : '—'}</div>
                 <div className="readiness-bar">
-                  <div className="readiness-fill" style={{ width: `${readiness.swim * 10}%` }}></div>
+                  <div className="readiness-fill" style={{ width: `${(readiness.swim || 0) * 10}%` }}></div>
                 </div>
                 <div className="readiness-label">
-                  {readiness.swim < 5 ? 'Needs Work' : readiness.swim < 7 ? 'Progressing' : 'Race Ready'}
+                  {readiness.swim === null ? 'No Data' : readiness.swim < 5 ? 'Needs Work' : readiness.swim < 7 ? 'Progressing' : 'Race Ready'}
                 </div>
               </div>
 
               <div className="readiness-card">
                 <div className="readiness-icon">🚴‍♂️</div>
                 <div className="readiness-sport">Bike</div>
-                <div className="readiness-score">{readiness.bike}/10</div>
+                <div className="readiness-score">{readiness.bike !== null ? `${readiness.bike}/10` : '—'}</div>
                 <div className="readiness-bar">
-                  <div className="readiness-fill" style={{ width: `${readiness.bike * 10}%` }}></div>
+                  <div className="readiness-fill" style={{ width: `${(readiness.bike || 0) * 10}%` }}></div>
                 </div>
                 <div className="readiness-label">
-                  {readiness.bike < 5 ? 'Needs Work' : readiness.bike < 7 ? 'Progressing' : 'Race Ready'}
+                  {readiness.bike === null ? 'No Data' : readiness.bike < 5 ? 'Needs Work' : readiness.bike < 7 ? 'Progressing' : 'Race Ready'}
                 </div>
               </div>
 
               <div className="readiness-card">
                 <div className="readiness-icon">🏃‍♂️</div>
                 <div className="readiness-sport">Run</div>
-                <div className="readiness-score">{readiness.run}/10</div>
+                <div className="readiness-score">{readiness.run !== null ? `${readiness.run}/10` : '—'}</div>
                 <div className="readiness-bar">
-                  <div className="readiness-fill" style={{ width: `${readiness.run * 10}%` }}></div>
+                  <div className="readiness-fill" style={{ width: `${(readiness.run || 0) * 10}%` }}></div>
                 </div>
                 <div className="readiness-label">
-                  {readiness.run < 5 ? 'Needs Work' : readiness.run < 7 ? 'Progressing' : 'Race Ready'}
+                  {readiness.run === null ? 'No Data' : readiness.run < 5 ? 'Needs Work' : readiness.run < 7 ? 'Progressing' : 'Race Ready'}
                 </div>
               </div>
             </div>
@@ -1481,11 +2308,24 @@ export default function IronCoach() {
         <div className="sidebar">
           <div className="upload-section">
             <h2>Upload Workouts</h2>
-            <label htmlFor="fitUpload">
-              <div className={`upload-btn ${uploading ? 'disabled' : ''}`}>
-                {uploading ? '⏳ Processing...' : '📁 Upload FIT Files'}
+            <div 
+              className={`upload-dropzone ${dragOver ? 'drag-over' : ''}`}
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onClick={() => !uploading && document.getElementById('fitUpload').click()}
+            >
+              <div className="upload-dropzone-icon">
+                {uploading ? '⏳' : dragOver ? '📥' : '📁'}
               </div>
-            </label>
+              <div className="upload-dropzone-text">
+                {uploading ? 'Processing...' : dragOver ? 'Drop files here' : 'Click or drag files'}
+              </div>
+              <div className="upload-dropzone-subtext">
+                Supported: .fit files from Garmin, Zwift, etc.
+              </div>
+            </div>
+            
             <input 
               type="file" 
               id="fitUpload" 
@@ -1495,9 +2335,15 @@ export default function IronCoach() {
               disabled={uploading}
               style={{ display: 'none' }}
             />
-            <div className="upload-help">
-              Supported: .fit files from Garmin, Zwift, etc.
-            </div>
+            
+            {uploadProgress && (
+              <div className="upload-progress">
+                {uploadProgress}
+                <div className="upload-progress-bar">
+                  <div className="upload-progress-fill" style={{ width: '100%' }}></div>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="workout-list">
@@ -1663,6 +2509,64 @@ export default function IronCoach() {
                     )}
                   </div>
 
+                  {/* Claude Coach Analysis */}
+                  <div className="claude-analysis-section">
+                    <div className="claude-analysis-header">
+                      🧠 Coach Analysis
+                      {isAnalyzing && <span className="claude-analyzing">(analyzing...)</span>}
+                    </div>
+                    {claudeAnalysis ? (
+                      <div className="claude-analysis-content">{claudeAnalysis}</div>
+                    ) : (
+                      <div className="claude-analyzing">
+                        {isAnalyzing ? 'Claude is analyzing your workout...' : 'Click "Get Analysis" to analyze this workout with Claude'}
+                      </div>
+                    )}
+                    {!claudeAnalysis && !isAnalyzing && (
+                      <button 
+                        onClick={() => getClaudeAnalysis(selectedWorkout)}
+                        className="upload-btn"
+                        style={{ marginTop: '1rem' }}
+                      >
+                        Get Claude Analysis
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Chat with Coach */}
+                  {claudeAnalysis && (
+                    <div className="chat-section">
+                      <div className="chat-header">💬 Ask Your Coach</div>
+                      {chatMessages.length > 1 && (
+                        <div className="chat-messages">
+                          {chatMessages.slice(1).map((msg, idx) => (
+                            <div key={idx} className={`chat-message ${msg.role}`}>
+                              {msg.content}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="chat-input-container">
+                        <input
+                          type="text"
+                          className="chat-input"
+                          placeholder="Ask about nutrition, pacing, drills, etc..."
+                          value={chatInput}
+                          onChange={(e) => setChatInput(e.target.value)}
+                          onKeyPress={(e) => e.key === 'Enter' && sendChatMessage()}
+                          disabled={isAnalyzing}
+                        />
+                        <button 
+                          className="chat-send-btn"
+                          onClick={sendChatMessage}
+                          disabled={isAnalyzing || !chatInput.trim()}
+                        >
+                          {isAnalyzing ? '...' : 'Send'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Charts first */}
                   {selectedWorkout.analysis.avgHR && renderHRChart(selectedWorkout)}
                   {selectedWorkout.analysis.powerDistribution && renderPowerDistribution(selectedWorkout)}
@@ -1676,6 +2580,172 @@ export default function IronCoach() {
         </div>
       </div>
     </div>
+
+    {/* Settings Modal */}
+    {showSettings && (
+      <div className="modal-overlay" onClick={() => setShowSettings(false)}>
+        <div className="modal-content settings-modal" onClick={e => e.stopPropagation()}>
+          <h2>⚙️ Athlete Settings</h2>
+          
+          <div className="settings-section">
+            <h3>Power & Fitness</h3>
+            <div className="settings-row">
+              <label>FTP (Functional Threshold Power)</label>
+              <div className="settings-input-group">
+                <input 
+                  type="number" 
+                  value={athleteConfig.ftp}
+                  onChange={e => setAthleteConfig({...athleteConfig, ftp: parseInt(e.target.value) || 190})}
+                />
+                <span>W</span>
+              </div>
+            </div>
+            <div className="settings-row">
+              <label>Weight</label>
+              <div className="settings-input-group">
+                <input 
+                  type="number" 
+                  value={athleteConfig.weight}
+                  onChange={e => setAthleteConfig({...athleteConfig, weight: parseInt(e.target.value) || 72})}
+                />
+                <span>kg</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>Race Targets (Oman 70.3)</h3>
+            <div className="settings-row">
+              <label>Bike Power Target</label>
+              <div className="settings-input-group">
+                <input 
+                  type="number" 
+                  value={athleteConfig.raceTargets.bikePower}
+                  onChange={e => setAthleteConfig({
+                    ...athleteConfig, 
+                    raceTargets: {...athleteConfig.raceTargets, bikePower: parseInt(e.target.value) || 160}
+                  })}
+                />
+                <span>W</span>
+              </div>
+            </div>
+            <div className="settings-row">
+              <label>Run Pace Target</label>
+              <div className="settings-input-group">
+                <input 
+                  type="text" 
+                  value={`${Math.floor(athleteConfig.raceTargets.runPace/60)}:${(athleteConfig.raceTargets.runPace%60).toString().padStart(2,'0')}`}
+                  onChange={e => {
+                    const parts = e.target.value.split(':');
+                    const min = parseInt(parts[0]) || 0;
+                    const sec = parseInt(parts[1]) || 0;
+                    setAthleteConfig({
+                      ...athleteConfig,
+                      raceTargets: {...athleteConfig.raceTargets, runPace: min * 60 + sec}
+                    });
+                  }}
+                />
+                <span>/km</span>
+              </div>
+            </div>
+            <div className="settings-row">
+              <label>Swim CSS</label>
+              <div className="settings-input-group">
+                <input 
+                  type="text" 
+                  value={`${Math.floor(athleteConfig.swimCSS/60)}:${(athleteConfig.swimCSS%60).toString().padStart(2,'0')}`}
+                  onChange={e => {
+                    const parts = e.target.value.split(':');
+                    const min = parseInt(parts[0]) || 0;
+                    const sec = parseInt(parts[1]) || 0;
+                    setAthleteConfig({...athleteConfig, swimCSS: min * 60 + sec});
+                  }}
+                />
+                <span>/100m</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="modal-actions">
+            <button className="btn-primary" onClick={() => setShowSettings(false)}>
+              Save Settings
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* Prescription Context Modal */}
+    {prescriptionModal.open && prescriptionModal.workout && (
+      <div className="modal-overlay">
+        <div className="modal-content prescription-modal">
+          <h2>
+            {prescriptionModal.workout.sport === 'swim' ? '🏊‍♂️' : 
+             prescriptionModal.workout.sport === 'bike' ? '🚴‍♂️' : '🏃‍♂️'} 
+            Workout Context
+          </h2>
+          <p className="modal-subtitle">
+            Professional analysis requires context. What was prescribed for this {prescriptionModal.workout.sport} session?
+          </p>
+          
+          <div className="workout-preview">
+            <span>{prescriptionModal.workout.date}</span>
+            <span>{prescriptionModal.workout.duration}</span>
+            <span>{prescriptionModal.workout.distance}</span>
+          </div>
+
+          <div className="prescription-form">
+            <div className="form-group">
+              <label>Coach's Prescription</label>
+              <input 
+                type="text" 
+                id="prescription-prescribed"
+                placeholder="e.g., Easy Z2, 60 min / Intervals 5x3min @ threshold"
+              />
+            </div>
+            <div className="form-group">
+              <label>Your Execution Plan</label>
+              <input 
+                type="text" 
+                id="prescription-plan"
+                placeholder="e.g., Warmup 15min, then 140W steady"
+              />
+            </div>
+            <div className="form-group">
+              <label>How did it feel? (optional)</label>
+              <input 
+                type="text" 
+                id="prescription-feel"
+                placeholder="e.g., Legs felt heavy from yesterday"
+              />
+            </div>
+          </div>
+
+          {prescriptionModal.queue.length > 0 && (
+            <div className="queue-indicator">
+              +{prescriptionModal.queue.length} more workout{prescriptionModal.queue.length > 1 ? 's' : ''} to process
+            </div>
+          )}
+
+          <div className="modal-actions">
+            <button 
+              className="btn-primary"
+              onClick={() => {
+                const prescribed = document.getElementById('prescription-prescribed').value;
+                const plan = document.getElementById('prescription-plan').value;
+                const feel = document.getElementById('prescription-feel').value;
+                savePrescription({ prescribed, plan, feel });
+              }}
+            >
+              Analyze Workout
+            </button>
+            <button className="btn-secondary" onClick={skipPrescription}>
+              Skip
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
     </>
   );
 }

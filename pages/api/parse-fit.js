@@ -4,207 +4,64 @@ export const config = {
   },
 };
 
-class FITParser {
-  constructor(buffer) {
-    this.data = new Uint8Array(buffer);
-    this.pos = 0;
-    this.definitions = {};
-    this.sessions = [];
-    this.laps = [];
-    this.records = [];
-  }
+// Athlete config - will be configurable from frontend later
+const ATHLETE_FTP = 190;
 
-  parse() {
-    const headerSize = this.data[0];
-    this.pos = headerSize;
-
-    while (this.pos < this.data.length - 2) {
-      if (!this.parseMessage()) break;
-    }
-
-    return {
-      sessions: this.sessions,
-      laps: this.laps,
-      records: this.records,
-    };
-  }
-
-  parseMessage() {
-    if (this.pos >= this.data.length) return false;
-
-    const header = this.data[this.pos++];
-
-    if (header & 0x40) {
-      return this.parseDefinition(header);
-    } else {
-      return this.parseData(header);
-    }
-  }
-
-  parseDefinition(header) {
-    const localMsg = header & 0x0f;
-
-    if (this.pos + 5 > this.data.length) return false;
-
-    const reserved = this.data[this.pos];
-    const arch = this.data[this.pos + 1];
-    const globalMsg = this.readUint16(this.pos + 2, arch === 0);
-    const numFields = this.data[this.pos + 4];
-    this.pos += 5;
-
-    const fields = [];
-    for (let i = 0; i < numFields; i++) {
-      if (this.pos + 3 > this.data.length) return false;
-      const fieldDef = this.data[this.pos];
-      const fieldSize = this.data[this.pos + 1];
-      const baseType = this.data[this.pos + 2];
-      fields.push([fieldDef, fieldSize, baseType]);
-      this.pos += 3;
-    }
-
-    this.definitions[localMsg] = {
-      global: globalMsg,
-      arch: arch,
-      fields: fields,
-    };
-
-    return true;
-  }
-
-  parseData(header) {
-    const localMsg = header & 0x0f;
-
-    if (!this.definitions[localMsg]) {
-      this.pos += 20;
-      return true;
-    }
-
-    const defn = this.definitions[localMsg];
-    const msgData = {};
-    const littleEndian = defn.arch === 0;
-
-    for (const [fieldNum, size, baseType] of defn.fields) {
-      if (this.pos + size > this.data.length) return false;
-
-      let value = null;
-      if (size === 1) {
-        value = this.data[this.pos];
-        if (value === 0xff) value = null;
-      } else if (size === 2) {
-        value = this.readUint16(this.pos, littleEndian);
-        if (value === 0xffff) value = null;
-      } else if (size === 4) {
-        value = this.readUint32(this.pos, littleEndian);
-        if (value === 0xffffffff) value = null;
-      }
-
-      this.pos += size;
-
-      if (value !== null) {
-        msgData[fieldNum] = value;
-      }
-    }
-
-    const globalMsg = defn.global;
-    if (globalMsg === 18) {
-      this.sessions.push(msgData);
-    } else if (globalMsg === 19) {
-      this.laps.push(msgData);
-    } else if (globalMsg === 20) {
-      this.records.push(msgData);
-    }
-
-    return true;
-  }
-
-  readUint16(pos, littleEndian) {
-    if (littleEndian) {
-      return this.data[pos] | (this.data[pos + 1] << 8);
-    } else {
-      return (this.data[pos] << 8) | this.data[pos + 1];
-    }
-  }
-
-  readUint32(pos, littleEndian) {
-    if (littleEndian) {
-      return (
-        this.data[pos] |
-        (this.data[pos + 1] << 8) |
-        (this.data[pos + 2] << 16) |
-        (this.data[pos + 3] << 24)
-      ) >>> 0;
-    } else {
-      return (
-        (this.data[pos] << 24) |
-        (this.data[pos + 1] << 16) |
-        (this.data[pos + 2] << 8) |
-        this.data[pos + 3]
-      ) >>> 0;
-    }
-  }
-}
-
-function analyzeWorkout(parsed) {
-  const { sessions, laps, records } = parsed;
-
-  if (!sessions || sessions.length === 0) {
+function analyzeWorkout(fitData) {
+  // fitData comes from fit-file-parser in cascade mode
+  // Structure: { sessions: [...], laps: [...], records: [...], activity: {...} }
+  
+  if (!fitData.sessions || fitData.sessions.length === 0) {
     return null;
   }
 
-  const session = sessions[0];
+  const session = fitData.sessions[0];
+  const records = fitData.records || [];
+  
   const analysis = {
-    readiness: 'warning',
+    readiness: 'good',
     feedback: [],
   };
 
-  // Correct FIT sport codes from Garmin SDK
-  const sportMap = { 
-    0: 'generic',
-    1: 'run',      // Running
-    2: 'bike',     // Cycling
-    5: 'swim'      // Swimming
-  };
+  // Sport detection - fit-file-parser returns string like 'cycling', 'running', 'swimming'
+  let sport = session.sport || 'unknown';
   
-  let sport = sportMap[session[5]];
-  
-  // If sport field is missing or unrecognized, try to infer
-  if (!sport || sport === 'generic') {
-    // Check for power data + low cadence = cycling
-    // Note: Field 20 (power) can be present for both bike AND run (running power estimates)
-    // Field 4 (cadence) invalid values: 0xFF (uint8), 0xFFFF (uint16), 0x7FFFFFFF or 0xFFFFFFFF (uint32)
-    const hasPower = session[20] != null && session[20] > 0 && session[20] !== 0xFFFF && session[20] !== 65535;
-    const avgCadence = session[4];
-    const validCadence = avgCadence != null && avgCadence !== 0xFF && avgCadence !== 0xFFFF && 
-                        avgCadence !== 0x7FFFFFFF && avgCadence !== 2147483647 && avgCadence !== 0xFFFFFFFF;
-    
-    // Cycling cadence is typically 60-120 RPM
-    // Running cadence is typically 150-180 SPM (stored as RPM, so 75-90 in FIT)
-    if (validCadence) {
-      if (avgCadence < 120) {
-        sport = 'bike'; // Low cadence = cycling
-      } else {
-        sport = 'run';  // High cadence = running
-      }
-    } else if (hasPower && session[20] > 100) {
-      // High power without cadence = likely cycling (running power is usually <100W)
-      sport = 'bike';
-    } else {
-      sport = 'bike'; // Default fallback
-    }
+  // Normalize sport names
+  if (sport === 'cycling' || sport === 'biking') {
+    sport = 'bike';
+  } else if (sport === 'running') {
+    sport = 'run';
+  } else if (sport === 'swimming' || sport === 'lap_swimming' || sport === 'open_water') {
+    sport = 'swim';
   }
 
-  const durationMs = session[8] || session[7] || 0;
-  const durationMin = durationMs / 1000 / 60;
-  const distanceM = (session[9] || 0) / 100000;
+  // Duration - fit-file-parser returns seconds directly
+  const durationSec = session.total_timer_time || session.total_elapsed_time || 0;
+  const durationMin = durationSec / 60;
+  
+  // Distance - fit-file-parser returns in the unit specified (we use km)
+  // But some files return meters, so check magnitude
+  let distanceKm = session.total_distance || 0;
+  if (distanceKm > 1000) {
+    // Probably in meters
+    distanceKm = distanceKm / 1000;
+  }
 
   analysis.duration = `${Math.round(durationMin)}min`;
-  analysis.distance = `${distanceM.toFixed(1)}km`;
+  analysis.durationMinutes = Math.round(durationMin);
+  analysis.distance = `${distanceKm.toFixed(1)}km`;
+  analysis.distanceKm = distanceKm;
 
-  if (session[16]) {
-    analysis.avgHR = session[16];
-    analysis.maxHR = session[17] || 0;
+  // HR Analysis
+  const avgHR = session.avg_heart_rate;
+  if (avgHR) {
+    analysis.avgHR = avgHR;
+    analysis.maxHR = session.max_heart_rate || 0;
 
-    const hrs = records.map(r => r[3]).filter(hr => hr && hr !== 255);
+    // Calculate HR drift from records
+    const hrs = records
+      .map(r => r.heart_rate)
+      .filter(hr => hr && hr > 0 && hr < 255);
 
     if (hrs.length > 100) {
       const quarter = Math.floor(hrs.length / 4);
@@ -215,115 +72,214 @@ function analyzeWorkout(parsed) {
       const avgLast = lastQuarter.reduce((a, b) => a + b, 0) / lastQuarter.length;
       const drift = avgLast - avgFirst;
 
+      analysis.hrDrift = Math.round(drift);
+
       const driftFeedback = {
         title: '❤️ Heart Rate Analysis',
-        type: Math.abs(drift) > 10 ? 'warning' : 'good',
+        type: Math.abs(drift) > 15 ? 'warning' : Math.abs(drift) > 10 ? 'caution' : 'good',
         items: [
-          `Average HR: ${analysis.avgHR} bpm`,
+          `Average HR: ${avgHR} bpm`,
           `HR Drift: <strong>${drift > 0 ? '+' : ''}${Math.round(drift)} bpm</strong> (first 25% vs last 25%)`,
         ],
       };
 
-      if (Math.abs(drift) > 10) {
-        driftFeedback.items.push('<strong>⚠️ Significant drift detected.</strong> This suggests cardiovascular fatigue. Focus on aerobic base building.');
+      if (Math.abs(drift) > 15) {
+        driftFeedback.items.push('<strong>⚠️ Significant drift detected.</strong> This indicates cardiovascular fatigue - likely fueling issue. Aim for 60-90g carbs/hour on efforts >90min.');
         analysis.readiness = 'warning';
+      } else if (Math.abs(drift) > 10) {
+        driftFeedback.items.push('Moderate drift - acceptable but monitor nutrition on longer efforts.');
       } else {
-        driftFeedback.items.push('✓ Good HR stability maintained throughout workout.');
+        driftFeedback.items.push('✓ Excellent HR stability throughout workout.');
       }
 
       analysis.feedback.push(driftFeedback);
     }
   }
 
-  if (sport === 'bike' && session[20]) {
-    analysis.avgPower = session[20];
-    analysis.maxPower = session[21] || 0;
+  // BIKE Analysis with FTP-based zones
+  if (sport === 'bike' && session.avg_power) {
+    analysis.avgPower = session.avg_power;
+    analysis.maxPower = session.max_power || 0;
 
-    const powers = records.map(r => r[7]).filter(p => p && p !== 65535);
+    const powers = records
+      .map(r => r.power)
+      .filter(p => p && p > 0 && p < 3000);
 
     if (powers.length > 0) {
       const total = powers.length;
+      const ftp = ATHLETE_FTP;
+
+      // Calculate power zones based on % of FTP
+      const z1Max = ftp * 0.55;  // 105W
+      const z2Max = ftp * 0.75;  // 143W
+      const z3Max = ftp * 0.90;  // 171W
+      const z4Max = ftp * 1.05;  // 200W
+
       analysis.powerDistribution = {
-        z1: Math.round((powers.filter(p => p < 120).length / total) * 1000) / 10,
-        z2: Math.round((powers.filter(p => p >= 120 && p < 150).length / total) * 1000) / 10,
-        z3: Math.round((powers.filter(p => p >= 150 && p < 190).length / total) * 1000) / 10,
-        z4: Math.round((powers.filter(p => p >= 190).length / total) * 1000) / 10,
+        z1: Math.round((powers.filter(p => p < z1Max).length / total) * 1000) / 10,
+        z2: Math.round((powers.filter(p => p >= z1Max && p < z2Max).length / total) * 1000) / 10,
+        z3: Math.round((powers.filter(p => p >= z2Max && p < z3Max).length / total) * 1000) / 10,
+        z4: Math.round((powers.filter(p => p >= z3Max && p < z4Max).length / total) * 1000) / 10,
+        z5: Math.round((powers.filter(p => p >= z4Max).length / total) * 1000) / 10,
       };
 
-      const sortedPowers = [...powers].sort((a, b) => b - a);
-      const top20Pct = sortedPowers.slice(0, Math.floor(powers.length / 5));
-      const npEstimate = top20Pct.reduce((a, b) => a + b, 0) / top20Pct.length;
-      const vi = analysis.avgPower > 0 ? npEstimate / analysis.avgPower : 1.0;
+      // Store zone boundaries for frontend display
+      analysis.powerZoneBoundaries = {
+        z1: Math.round(z1Max),
+        z2: Math.round(z2Max),
+        z3: Math.round(z3Max),
+        z4: Math.round(z4Max),
+        ftp: ftp
+      };
+
+      // Normalized Power calculation (proper 30s rolling average)
+      let np = analysis.avgPower;
+      if (powers.length >= 30) {
+        const rollingAvgs = [];
+        for (let i = 29; i < powers.length; i++) {
+          const window = powers.slice(i - 29, i + 1);
+          const avg = window.reduce((a, b) => a + b, 0) / 30;
+          rollingAvgs.push(Math.pow(avg, 4));
+        }
+        np = Math.pow(rollingAvgs.reduce((a, b) => a + b, 0) / rollingAvgs.length, 0.25);
+      }
+      
+      analysis.normalizedPower = Math.round(np);
+      const vi = analysis.avgPower > 0 ? np / analysis.avgPower : 1.0;
+      analysis.variabilityIndex = Math.round(vi * 100) / 100;
 
       const powerFeedback = {
         title: '⚡ Power Analysis',
-        type: vi > 1.05 ? 'warning' : 'good',
+        type: vi > 1.10 ? 'warning' : vi > 1.05 ? 'caution' : 'good',
         items: [
-          `Average Power: ${analysis.avgPower}W`,
-          `Variability Index: <strong>${vi.toFixed(2)}</strong> (target: <1.05)`,
+          `Average Power: ${analysis.avgPower}W (${Math.round(analysis.avgPower / ftp * 100)}% FTP)`,
+          `Normalized Power: ${analysis.normalizedPower}W`,
+          `Variability Index: <strong>${vi.toFixed(2)}</strong> (target: <1.05 for triathlon)`,
         ],
       };
 
-      if (vi > 1.05) {
-        powerFeedback.items.push('<strong>⚠️ Poor power discipline.</strong> Too much variation indicates surging. Practice steady-state efforts.');
+      if (vi > 1.10) {
+        powerFeedback.items.push('<strong>⚠️ Poor power discipline.</strong> Excessive surging - practice holding steady power.');
         analysis.readiness = 'warning';
+      } else if (vi > 1.05) {
+        powerFeedback.items.push('Moderate variability - work on smoothing out power.');
       } else {
-        powerFeedback.items.push('✓ Excellent power discipline maintained.');
+        powerFeedback.items.push('✓ Excellent power discipline - race-ready pacing.');
       }
 
-      if (analysis.powerDistribution.z4 > 15) {
-        powerFeedback.items.push(`<strong>⚠️ ${analysis.powerDistribution.z4}% above FTP.</strong> For Ironman, keep >190W efforts under 10%.`);
+      // Check time above FTP
+      if (analysis.powerDistribution.z5 > 10) {
+        powerFeedback.items.push(`<strong>⚠️ ${analysis.powerDistribution.z5.toFixed(0)}% above FTP.</strong> For 70.3, keep supra-threshold under 5%.`);
       }
 
       analysis.feedback.push(powerFeedback);
     }
   }
 
-  if (sport === 'run' && session[14] && session[14] > 0) {
-    const paceSec = 1000 / (session[14] / 1000);
-    const paceMin = Math.floor(paceSec / 60);
-    const paceSecs = Math.floor(paceSec % 60);
-    analysis.avgPace = `${paceMin}:${paceSecs.toString().padStart(2, '0')}`;
-
-    const runFeedback = {
-      title: '🏃 Run Analysis',
-      type: 'good',
-      items: [
-        `Average Pace: ${analysis.avgPace} /km`,
-        `Distance: ${distanceM.toFixed(2)} km`,
-      ],
-    };
-
-    if (durationMin > 60) {
-      runFeedback.items.push('✓ Good long run volume for half marathon training.');
+  // RUN Analysis
+  if (sport === 'run') {
+    // fit-file-parser returns avg_speed in km/h when configured
+    let paceSeconds = null;
+    
+    if (session.avg_speed && session.avg_speed > 0) {
+      // Convert km/h to min/km
+      paceSeconds = 3600 / session.avg_speed;
+    } else if (distanceKm > 0 && durationMin > 0) {
+      paceSeconds = (durationMin * 60) / distanceKm;
     }
 
-    analysis.feedback.push(runFeedback);
+    if (paceSeconds && paceSeconds > 0 && paceSeconds < 1200) {
+      const paceMin = Math.floor(paceSeconds / 60);
+      const paceSecs = Math.floor(paceSeconds % 60);
+      analysis.avgPace = `${paceMin}:${paceSecs.toString().padStart(2, '0')}`;
+      analysis.avgPaceSeconds = paceSeconds;
+
+      const runFeedback = {
+        title: '🏃 Run Analysis',
+        type: 'good',
+        items: [
+          `Average Pace: ${analysis.avgPace} /km`,
+          `Distance: ${distanceKm.toFixed(2)} km`,
+        ],
+      };
+
+      if (durationMin > 75) {
+        runFeedback.items.push('✓ Good long run volume for half marathon prep.');
+        if (analysis.hrDrift && analysis.hrDrift > 15) {
+          runFeedback.type = 'warning';
+          runFeedback.items.push(`<strong>⚠️ HR drift of ${analysis.hrDrift} bpm on long run.</strong> Likely underfueled.`);
+        }
+      }
+
+      analysis.feedback.push(runFeedback);
+    }
+  }
+
+  // SWIM Analysis
+  if (sport === 'swim') {
+    let paceSeconds = null;
+    
+    // Convert distance to meters for swim
+    const distanceM = distanceKm * 1000;
+    
+    if (distanceM > 0 && durationMin > 0) {
+      // Pace per 100m
+      paceSeconds = (durationMin * 60) / (distanceM / 100);
+    }
+
+    if (paceSeconds && paceSeconds > 0 && paceSeconds < 600) {
+      const paceMin = Math.floor(paceSeconds / 60);
+      const paceSecs = Math.floor(paceSeconds % 60);
+      analysis.avgPace = `${paceMin}:${paceSecs.toString().padStart(2, '0')}`;
+      analysis.avgPaceSeconds = paceSeconds;
+
+      const projectedTime = (paceSeconds / 100) * 1900 / 60;
+      analysis.projectedRaceSwim = Math.round(projectedTime);
+
+      const swimFeedback = {
+        title: '🏊 Swim Analysis',
+        type: projectedTime > 65 ? 'warning' : projectedTime > 55 ? 'caution' : 'good',
+        items: [
+          `Average Pace: ${analysis.avgPace} /100m`,
+          `Distance: ${distanceM.toFixed(0)}m`,
+          `Projected 1.9km time: <strong>${Math.round(projectedTime)} min</strong> (cutoff: 70min)`,
+        ],
+      };
+
+      const cutoffBuffer = 70 - projectedTime;
+      if (cutoffBuffer < 5) {
+        swimFeedback.items.push(`<strong>🚨 CRITICAL: Only ${Math.round(cutoffBuffer)} min buffer to cutoff!</strong>`);
+        analysis.readiness = 'critical';
+      } else if (cutoffBuffer < 15) {
+        swimFeedback.items.push(`⚠️ ${Math.round(cutoffBuffer)} min buffer - build more consistency.`);
+        analysis.readiness = 'warning';
+      } else {
+        swimFeedback.items.push(`✓ ${Math.round(cutoffBuffer)} min buffer to cutoff - well positioned.`);
+      }
+
+      analysis.feedback.push(swimFeedback);
+    }
   }
 
   if (analysis.feedback.length === 0) {
     analysis.readiness = 'good';
   }
 
-  // Extract workout date from FIT file
-  const FIT_EPOCH = new Date(Date.UTC(1989, 11, 31, 0, 0, 0)); // FIT epoch: Dec 31, 1989
+  // Extract workout date
   let workoutDate = new Date();
-  
-  if (session[253]) {
-    // Field 253 is timestamp in seconds since FIT epoch
-    const timestamp = session[253];
-    workoutDate = new Date(FIT_EPOCH.getTime() + timestamp * 1000);
-  } else if (session[2]) {
-    // Field 2 is also sometimes used for timestamp
-    const timestamp = session[2];
-    workoutDate = new Date(FIT_EPOCH.getTime() + timestamp * 1000);
+  if (session.start_time) {
+    workoutDate = new Date(session.start_time);
+  } else if (session.timestamp) {
+    workoutDate = new Date(session.timestamp);
   }
 
   return {
     sport,
     date: workoutDate.toISOString().split('T')[0],
     duration: analysis.duration,
+    durationMinutes: analysis.durationMinutes,
     distance: analysis.distance,
+    distanceKm: analysis.distanceKm,
     analysis,
   };
 }
@@ -343,8 +299,9 @@ export default async function handler(req, res) {
 
   try {
     const busboy = require('busboy');
+    const FitParser = require('fit-file-parser').default;
     
-    const fitData = await new Promise((resolve, reject) => {
+    const fitBuffer = await new Promise((resolve, reject) => {
       const bb = busboy({ headers: req.headers });
       let fileBuffer = null;
 
@@ -365,21 +322,38 @@ export default async function handler(req, res) {
       req.pipe(bb);
     });
 
-    if (!fitData || fitData.length < 14) {
+    if (!fitBuffer || fitBuffer.length < 14) {
       return res.status(400).json({ error: 'No valid FIT file uploaded' });
     }
 
-    const parser = new FITParser(fitData);
-    const parsed = parser.parse();
-    const result = analyzeWorkout(parsed);
+    // Use fit-file-parser library
+    const fitParser = new FitParser({
+      force: true,
+      speedUnit: 'km/h',
+      lengthUnit: 'km',
+      elapsedRecordField: true,
+      mode: 'list',  // Get flat lists of sessions, records, etc.
+    });
+
+    const fitData = await new Promise((resolve, reject) => {
+      fitParser.parse(fitBuffer, (error, data) => {
+        if (error) {
+          reject(new Error(error));
+        } else {
+          resolve(data);
+        }
+      });
+    });
+
+    const result = analyzeWorkout(fitData);
 
     if (!result) {
-      return res.status(400).json({ error: 'Could not analyze FIT file' });
+      return res.status(400).json({ error: 'Could not analyze FIT file - no session data found' });
     }
 
     return res.status(200).json(result);
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Parse error:', error);
     return res.status(500).json({ error: error.message });
   }
 }
