@@ -16,6 +16,10 @@ export default function IronCoach() {
     run: null
   });
   
+  // PMC (Performance Management Chart) data from analyze-history API
+  const [pmc, setPmc] = useState(null);
+  const [fullReadiness, setFullReadiness] = useState(null);
+  
   // Claude chat state
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
@@ -48,76 +52,28 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
   
   const raceDate = new Date(Date.UTC(2026, 1, 14, 6, 0, 0));
 
-// Calculate readiness scores from workout data
+// Calculate readiness scores from API (uses TSS, PMC, efficiency)
   useEffect(() => {
     if (workouts.length === 0) return;
     
-    const sixWeeksAgo = new Date();
-    sixWeeksAgo.setDate(sixWeeksAgo.getDate() - 42);
-    const recent = workouts.filter(w => new Date(w.date) > sixWeeksAgo);
-    
-    // SWIM readiness
-    const swims = recent.filter(w => w.sport === 'swim');
-    let swimScore = 0;
-    if (swims.length > 0) {
-      const avgProjected = swims.reduce((sum, w) => {
-        return sum + (w.analysis?.projectedRaceSwim || 70);
-      }, 0) / swims.length;
-      
-      if (avgProjected < 50) swimScore = 9;
-      else if (avgProjected < 55) swimScore = 7;
-      else if (avgProjected < 60) swimScore = 5;
-      else if (avgProjected < 65) swimScore = 3;
-      else swimScore = 1;
-      
-      // Volume bonus
-      if (swims.length >= 3) swimScore = Math.min(10, swimScore + 1);
-    }
-    
-    // BIKE readiness
-    const bikes = recent.filter(w => w.sport === 'bike');
-    let bikeScore = 0;
-    if (bikes.length > 0) {
-      const avgVI = bikes.reduce((sum, w) => {
-        return sum + (w.analysis?.variabilityIndex || 1.1);
-      }, 0) / bikes.length;
-      
-      if (avgVI < 1.03) bikeScore = 9;
-      else if (avgVI < 1.05) bikeScore = 7;
-      else if (avgVI < 1.08) bikeScore = 5;
-      else if (avgVI < 1.10) bikeScore = 3;
-      else bikeScore = 1;
-      
-      // Long ride bonus (>2hr)
-      const hasLongRide = bikes.some(w => w.durationMinutes > 120);
-      if (hasLongRide) bikeScore = Math.min(10, bikeScore + 1);
-    }
-    
-    // RUN readiness
-    const runs = recent.filter(w => w.sport === 'run');
-    let runScore = 0;
-    if (runs.length > 0) {
-      const avgDrift = runs.reduce((sum, w) => {
-        return sum + Math.abs(w.analysis?.hrDrift || 15);
-      }, 0) / runs.length;
-      
-      if (avgDrift < 8) runScore = 9;
-      else if (avgDrift < 12) runScore = 7;
-      else if (avgDrift < 15) runScore = 5;
-      else if (avgDrift < 20) runScore = 3;
-      else runScore = 1;
-      
-      // Long run bonus (>75min)
-      const hasLongRun = runs.some(w => w.durationMinutes > 75);
-      if (hasLongRun) runScore = Math.min(10, runScore + 1);
-    }
-    
-    setReadiness({
-      swim: swimScore > 0 ? swimScore : null,
-      bike: bikeScore > 0 ? bikeScore : null,
-      run: runScore > 0 ? runScore : null
-    });
-  }, [workouts]);
+    fetch('/api/analyze-history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workouts, athleteConfig })
+    })
+    .then(r => r.json())
+    .then(data => {
+      setPmc(data.pmc);
+      setFullReadiness(data.readiness);
+      // Map to existing readiness format for backward compatibility
+      setReadiness({
+        swim: data.readiness?.swim?.score || null,
+        bike: data.readiness?.bike?.score || null,
+        run: data.readiness?.run?.score || null
+      });
+    })
+    .catch(err => console.error('History analysis failed:', err));
+  }, [workouts, athleteConfig]);
 
   // Countdown timer
   useEffect(() => {
@@ -282,7 +238,9 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
         body: JSON.stringify({ 
           workout,
           athleteConfig,
-          prescription: workout.prescription
+          prescription: workout.prescription,
+          pmc,
+          readiness: fullReadiness
         })
       });
       
@@ -325,7 +283,11 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           message: userMessage,
-          conversationHistory: newMessages
+          conversationHistory: newMessages,
+          workout: selectedWorkout,
+          athleteConfig,
+          pmc,
+          readiness: fullReadiness
         })
       });
       

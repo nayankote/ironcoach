@@ -1,18 +1,15 @@
+// =============================================================================
 // IronCoach - Claude Coaching Analysis API
-// Provides AI-powered workout feedback using Anthropic's Claude
+// Enhanced with TSS, PMC, efficiency context for smarter coaching
+// =============================================================================
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -23,84 +20,60 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { workout, message, conversationHistory, athleteConfig, prescription } = req.body;
+    const { 
+      workout, 
+      message, 
+      conversationHistory, 
+      athleteConfig, 
+      prescription,
+      pmc,           // NEW: PMC data from analyze-history
+      readiness      // NEW: Readiness scores
+    } = req.body;
 
-    // Build context about the athlete
-    const athleteContext = athleteConfig ? `
-Athlete Profile:
-- FTP: ${athleteConfig.ftp}W
-- Weight: ${athleteConfig.weight}kg
-- Run threshold: ${Math.floor(athleteConfig.runThresholdPace/60)}:${(athleteConfig.runThresholdPace%60).toString().padStart(2,'0')}/km
-- Swim CSS: ${Math.floor(athleteConfig.swimCSS/60)}:${(athleteConfig.swimCSS%60).toString().padStart(2,'0')}/100m
-- Race: Ironman 70.3 Oman (Feb 14, 2026)
-- Race targets: Swim <50min, Bike 3:45 @ ~160W, Run 2:00 @ 5:40/km
-` : `
-Athlete Profile:
-- FTP: 190W
-- Weight: 72kg
-- Race: Ironman 70.3 Oman (Feb 14, 2026)
-- Key constraint: 70-minute swim cutoff
-`;
+    // Build athlete context
+    const athleteContext = buildAthleteContext(athleteConfig);
+    
+    // Build workout context with all the new metrics
+    const workoutContext = buildWorkoutContext(workout, prescription);
+    
+    // Build training load context
+    const loadContext = buildLoadContext(pmc, readiness);
+    
+    // Build coaching insights (auto-generated from parse-fit)
+    const insightsContext = workout?.coachingInsights?.length > 0
+      ? `\nKey Insights:\n${workout.coachingInsights.map(i => `• ${i}`).join('\n')}`
+      : '';
 
-    // Build workout context
-    let workoutContext = '';
-    if (workout) {
-      workoutContext = `
-Workout Data:
-- Sport: ${workout.sport}
-- Date: ${workout.date}
-- Duration: ${workout.duration}
-- Distance: ${workout.distance}
-`;
-      
-      if (workout.analysis) {
-        const a = workout.analysis;
-        if (a.avgHR) workoutContext += `- Avg HR: ${a.avgHR} bpm\n`;
-        if (a.hrDrift !== undefined) workoutContext += `- HR Drift: ${a.hrDrift > 0 ? '+' : ''}${a.hrDrift} bpm\n`;
-        if (a.avgPower) workoutContext += `- Avg Power: ${a.avgPower}W\n`;
-        if (a.normalizedPower) workoutContext += `- Normalized Power: ${a.normalizedPower}W\n`;
-        if (a.variabilityIndex) workoutContext += `- Variability Index: ${a.variabilityIndex}\n`;
-        if (a.avgPace) workoutContext += `- Avg Pace: ${a.avgPace}\n`;
-        if (a.projectedRaceSwim) workoutContext += `- Projected 1.9km swim: ${a.projectedRaceSwim} min\n`;
-        
-        if (a.powerDistribution) {
-          workoutContext += `- Power Distribution: Z1 ${a.powerDistribution.z1}%, Z2 ${a.powerDistribution.z2}%, Z3 ${a.powerDistribution.z3}%, Z4 ${a.powerDistribution.z4}%\n`;
-        }
-      }
+    const systemPrompt = `You are an elite Ironman triathlon coach. You have deep expertise in endurance training, race execution, and sport science.
 
-      if (prescription) {
-        workoutContext += `
-Coach Prescription: ${prescription.prescribed || 'Not specified'}
-Athlete's Plan: ${prescription.plan || 'Not specified'}
-How it felt: ${prescription.feel || 'Not specified'}
-`;
-      }
-    }
-
-    // Build the prompt
-    const systemPrompt = `You are an elite Ironman triathlon coach analyzing workout data for an athlete preparing for Ironman 70.3 Oman.
-
-Your coaching philosophy:
-1. Be direct and specific - no generic advice
-2. Always relate feedback to race-day implications
-3. Prioritize: swim cutoff risk > bike pacing discipline > run HR management
-4. Give ONE concrete action item per response
-5. Use the athlete's actual numbers, not general ranges
-
-Critical race context:
-- 70-minute swim cutoff is the #1 risk
-- 800m elevation gain on bike requires steady power discipline
-- Run is off the bike - HR drift management is critical
-
+ATHLETE PROFILE:
 ${athleteContext}
-${workoutContext}
 
-Respond concisely (3-5 sentences max). Be encouraging but honest about gaps.`;
+TRAINING CONTEXT:
+${loadContext}
+
+${workoutContext}
+${insightsContext}
+
+COACHING PRINCIPLES:
+1. Be specific - use the athlete's actual numbers
+2. Relate everything to race-day implications for Ironman 70.3 Oman
+3. Priority order: swim cutoff > bike power discipline > run HR management
+4. Give ONE concrete action item
+5. Be encouraging but honest about gaps
+6. Reference TSS, efficiency, and intervals when available
+
+RACE SPECIFICS:
+- 1.9km ocean swim with 70-minute HARD CUTOFF (priority #1)
+- 90km bike with 800m elevation gain (requires power discipline)
+- 21.1km run off the bike (HR drift management critical)
+- Expected conditions: 22-28°C, potentially windy
+
+Respond concisely (3-5 sentences). Be direct.`;
 
     let messages = [];
     
     if (conversationHistory && conversationHistory.length > 0) {
-      // Continue conversation
       messages = conversationHistory.map(m => ({
         role: m.role,
         content: m.content
@@ -109,13 +82,11 @@ Respond concisely (3-5 sentences max). Be encouraging but honest about gaps.`;
         messages.push({ role: 'user', content: message });
       }
     } else if (workout) {
-      // Initial workout analysis
       messages = [{
         role: 'user',
-        content: `Analyze this ${workout.sport} workout and give me your coaching verdict. What did I do well? What's the one thing I should focus on improving?`
+        content: `Analyze this ${workout.sport} workout. What's your coaching verdict? What did I execute well, and what's the #1 thing to focus on?`
       }];
     } else if (message) {
-      // General question
       messages = [{ role: 'user', content: message }];
     } else {
       return res.status(400).json({ error: 'No workout or message provided' });
@@ -130,7 +101,7 @@ Respond concisely (3-5 sentences max). Be encouraging but honest about gaps.`;
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 500,
+        max_tokens: 600,
         system: systemPrompt,
         messages: messages
       })
@@ -139,10 +110,7 @@ Respond concisely (3-5 sentences max). Be encouraging but honest about gaps.`;
     if (!response.ok) {
       const error = await response.text();
       console.error('Anthropic API error:', error);
-      return res.status(response.status).json({ 
-        error: 'Failed to get analysis',
-        details: error
-      });
+      return res.status(response.status).json({ error: 'Failed to get analysis', details: error });
     }
 
     const data = await response.json();
@@ -154,4 +122,115 @@ Respond concisely (3-5 sentences max). Be encouraging but honest about gaps.`;
     console.error('Analysis error:', error);
     return res.status(500).json({ error: error.message });
   }
+}
+
+// =============================================================================
+// CONTEXT BUILDERS
+// =============================================================================
+
+function buildAthleteContext(config) {
+  if (!config) {
+    return `FTP: 190W | Weight: 72kg | Race: Ironman 70.3 Oman (Feb 14, 2026)`;
+  }
+  
+  const runPace = config.runThresholdPace 
+    ? `${Math.floor(config.runThresholdPace/60)}:${(config.runThresholdPace%60).toString().padStart(2,'0')}/km`
+    : '5:00/km';
+  const swimCSS = config.swimCSS
+    ? `${Math.floor(config.swimCSS/60)}:${(config.swimCSS%60).toString().padStart(2,'0')}/100m`
+    : '3:00/100m';
+
+  return `FTP: ${config.ftp || 190}W | Weight: ${config.weight || 72}kg
+Run threshold: ${runPace} | Swim CSS: ${swimCSS}
+Race: Ironman 70.3 Oman (Feb 14, 2026)
+Targets: Swim <50min, Bike ~3:45 @ 160W, Run ~2:00 @ 5:40/km`;
+}
+
+function buildWorkoutContext(workout, prescription) {
+  if (!workout) return '';
+  
+  let context = `
+WORKOUT DATA:
+Sport: ${workout.sport.toUpperCase()}
+Date: ${workout.date}
+Duration: ${workout.duration} | Distance: ${workout.distance}`;
+
+  const a = workout.analysis || {};
+  
+  // Core metrics
+  if (a.avgHR) context += `\nAvg HR: ${a.avgHR} bpm`;
+  if (a.hrDrift !== undefined) context += ` | HR Drift: ${a.hrDrift > 0 ? '+' : ''}${a.hrDrift} bpm`;
+  
+  // Bike-specific
+  if (workout.sport === 'bike') {
+    if (a.avgPower) context += `\nAvg Power: ${a.avgPower}W`;
+    if (a.normalizedPower) context += ` | NP: ${a.normalizedPower}W`;
+    if (a.variabilityIndex) context += ` | VI: ${a.variabilityIndex}`;
+    if (a.intensityFactor) context += ` | IF: ${a.intensityFactor}`;
+    if (a.powerDistribution) {
+      context += `\nPower Zones: Z1 ${a.powerDistribution.z1}%, Z2 ${a.powerDistribution.z2}%, Z3 ${a.powerDistribution.z3}%, Z4 ${a.powerDistribution.z4}%, Z5 ${a.powerDistribution.z5}%`;
+    }
+  }
+  
+  // Run-specific
+  if (workout.sport === 'run') {
+    if (a.avgPace) context += `\nPace: ${a.avgPace}/km`;
+    if (a.projectedHalfMarathon) context += ` | Projected HM: ${Math.floor(a.projectedHalfMarathon/60)}h${a.projectedHalfMarathon%60}min`;
+  }
+  
+  // Swim-specific
+  if (workout.sport === 'swim') {
+    if (a.avgPace) context += `\nPace: ${a.avgPace}/100m`;
+    if (a.projectedRaceSwim) {
+      const buffer = 70 - a.projectedRaceSwim;
+      context += ` | Projected 1.9km: ${a.projectedRaceSwim}min (${buffer > 0 ? buffer : 'OVER'} min to cutoff)`;
+    }
+  }
+  
+  // NEW: Advanced metrics
+  if (workout.tss) context += `\nTSS: ${workout.tss}`;
+  if (workout.intensityFactor) context += ` | IF: ${workout.intensityFactor}`;
+  
+  if (workout.efficiency) {
+    context += `\nEfficiency: ${workout.efficiency.status} (${workout.efficiency.aerobicDecoupling}% decoupling)`;
+  }
+  
+  if (workout.intervals && workout.intervals.type !== 'steady') {
+    context += `\nIntervals: ${workout.intervals.workIntervals} work intervals`;
+    if (workout.intervals.avgWorkPower) {
+      context += ` @ ${workout.intervals.avgWorkPower}W avg`;
+    }
+  }
+  
+  // Prescription context
+  if (prescription) {
+    context += `\n\nPRESCRIPTION:`;
+    if (prescription.prescribed) context += `\nCoach prescribed: ${prescription.prescribed}`;
+    if (prescription.plan) context += `\nAthlete planned: ${prescription.plan}`;
+    if (prescription.feel) context += `\nHow it felt: ${prescription.feel}`;
+  }
+
+  return context;
+}
+
+function buildLoadContext(pmc, readiness) {
+  let context = '';
+  
+  if (pmc) {
+    context += `\nTRAINING LOAD:`;
+    context += `\nFitness (CTL): ${pmc.ctl} | Fatigue (ATL): ${pmc.atl} | Form (TSB): ${pmc.tsb}`;
+    if (pmc.formStatus) context += ` (${pmc.formStatus})`;
+    if (pmc.rampRate) context += `\nRamp rate: ${pmc.rampRate > 0 ? '+' : ''}${pmc.rampRate} CTL/day`;
+  }
+  
+  if (readiness) {
+    context += `\n\nREADINESS SCORES:`;
+    if (readiness.swim) context += `\nSwim: ${readiness.swim.score}/10 (${readiness.swim.status})`;
+    if (readiness.bike) context += `\nBike: ${readiness.bike.score}/10 (${readiness.bike.status})`;
+    if (readiness.run) context += `\nRun: ${readiness.run.score}/10 (${readiness.run.status})`;
+    if (readiness.overall) context += `\nOverall: ${readiness.overall}/10`;
+    if (readiness.limiter) context += ` | Limiter: ${readiness.limiter.toUpperCase()}`;
+  }
+  
+  return context;
 }
