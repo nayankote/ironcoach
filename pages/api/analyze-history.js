@@ -197,7 +197,7 @@ function calculateReadiness(workouts, athlete) {
     readiness.swim = {
       score: Math.round(score),
       factors,
-      status: score >= 7 ? 'ready' : score >= 4 ? 'building' : 'critical'
+      status: score >= 8 ? 'ready' : score >= 4 ? 'building' : 'critical'
     };
   }
 
@@ -250,7 +250,7 @@ function calculateReadiness(workouts, athlete) {
     readiness.bike = {
       score: Math.round(score),
       factors,
-      status: score >= 7 ? 'ready' : score >= 4 ? 'building' : 'needs_work'
+      status: score >= 8 ? 'ready' : score >= 4 ? 'building' : 'needs_work'
     };
   }
 
@@ -303,7 +303,7 @@ function calculateReadiness(workouts, athlete) {
     readiness.run = {
       score: Math.round(score),
       factors,
-      status: score >= 7 ? 'ready' : score >= 4 ? 'building' : 'needs_work'
+      status: score >= 8 ? 'ready' : score >= 4 ? 'building' : 'needs_work'
     };
   }
 

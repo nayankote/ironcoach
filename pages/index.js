@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from 'react';
+import { supabase } from '../lib/supabase';
 
 export default function IronCoach() {
+  // Auth state
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState('login'); // 'login' or 'signup'
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+
   const [workouts, setWorkouts] = useState([]);
   const [currentMonth, setCurrentMonth] = useState(new Date());
   const [selectedWorkout, setSelectedWorkout] = useState(null);
@@ -25,6 +34,131 @@ export default function IronCoach() {
   const [chatInput, setChatInput] = useState('');
 const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [claudeAnalysis, setClaudeAnalysis] = useState(null);
+
+  // ===========================================
+  // AUTH: Check session on mount
+  // ===========================================
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ===========================================
+  // LOAD WORKOUTS FROM SUPABASE ON LOGIN
+  // ===========================================
+  useEffect(() => {
+    if (!user) {
+      setWorkouts([]);
+      return;
+    }
+    
+    const loadWorkouts = async () => {
+      const { data, error } = await supabase
+        .from('workouts')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('date', { ascending: false });
+      
+      if (error) {
+        console.error('Failed to load workouts:', error);
+        return;
+      }
+      
+      // Transform from DB format to app format
+      const loaded = data.map(w => ({
+        id: w.id,
+        filename: w.filename,
+        sport: w.sport,
+        date: w.date,
+        duration: `${w.duration_minutes}min`,
+        durationMinutes: w.duration_minutes,
+        distance: `${w.distance_km}km`,
+        distanceKm: w.distance_km,
+        tss: w.tss,
+        analysis: w.analysis,
+        efficiency: w.efficiency,
+        intervals: w.intervals,
+        coachingInsights: w.coaching_insights,
+        prescription: w.prescription,
+      }));
+      
+      setWorkouts(loaded);
+    };
+    
+    loadWorkouts();
+  }, [user]);
+
+  // ===========================================
+  // AUTH HANDLERS
+  // ===========================================
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authEmail,
+      password: authPassword,
+    });
+    
+    if (error) {
+      setAuthError(error.message);
+    }
+  };
+
+  const handleSignup = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    
+    const { error } = await supabase.auth.signUp({
+      email: authEmail,
+      password: authPassword,
+    });
+    
+    if (error) {
+      setAuthError(error.message);
+    } else {
+      setAuthError('Check your email for confirmation link!');
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setWorkouts([]);
+  };
+
+  // ===========================================
+  // SAVE WORKOUT TO SUPABASE
+  // ===========================================
+  const saveWorkoutToSupabase = async (workout) => {
+    if (!user) return;
+    
+    const { error } = await supabase.from('workouts').insert({
+      user_id: user.id,
+      filename: workout.filename,
+      sport: workout.sport,
+      date: workout.date,
+      duration_minutes: workout.durationMinutes,
+      distance_km: workout.distanceKm,
+      tss: workout.tss,
+      analysis: workout.analysis,
+      efficiency: workout.efficiency,
+      intervals: workout.intervals,
+      coaching_insights: workout.coachingInsights,
+      prescription: workout.prescription,
+    });
+    
+    if (error) {
+      console.error('Failed to save workout:', error);
+    }
+  };
   
   // NEW: Athlete configuration
   const [athleteConfig, setAthleteConfig] = useState({
@@ -155,11 +289,14 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
   };
 
   // NEW: Handle prescription save
-  const savePrescription = (prescription) => {
+  const savePrescription = async (prescription) => {
     const workoutWithPrescription = {
       ...prescriptionModal.workout,
       prescription
     };
+    
+    // Save to Supabase
+    await saveWorkoutToSupabase(workoutWithPrescription);
     
     const updated = [...workouts, workoutWithPrescription].sort((a, b) => 
       new Date(b.date) - new Date(a.date)
@@ -181,8 +318,12 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
     }
   };
 
-  const skipPrescription = () => {
+  const skipPrescription = async () => {
     const workout = prescriptionModal.workout;
+    
+    // Save to Supabase even without prescription
+    await saveWorkoutToSupabase(workout);
+    
     const updated = [...workouts, workout].sort((a, b) => 
       new Date(b.date) - new Date(a.date)
     );
@@ -2191,18 +2332,177 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
         .btn-secondary:hover {
           background: #f5f5f5;
         }
+
+        /* Auth Styles */
+        .auth-container {
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+        }
+        .auth-box {
+          background: white;
+          padding: 2.5rem;
+          border-radius: 16px;
+          box-shadow: var(--shadow-lg);
+          width: 100%;
+          max-width: 400px;
+        }
+        .auth-title {
+          font-size: 1.75rem;
+          font-weight: 700;
+          text-align: center;
+          margin-bottom: 0.5rem;
+          color: var(--text-primary);
+        }
+        .auth-subtitle {
+          text-align: center;
+          color: var(--text-secondary);
+          margin-bottom: 2rem;
+        }
+        .auth-form {
+          display: flex;
+          flex-direction: column;
+          gap: 1rem;
+        }
+        .auth-input {
+          padding: 0.875rem 1rem;
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          font-size: 1rem;
+          transition: border-color 0.2s;
+        }
+        .auth-input:focus {
+          outline: none;
+          border-color: var(--primary);
+        }
+        .auth-btn {
+          padding: 0.875rem;
+          background: var(--primary);
+          color: white;
+          border: none;
+          border-radius: 8px;
+          font-size: 1rem;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.2s;
+        }
+        .auth-btn:hover {
+          background: var(--primary-dark);
+        }
+        .auth-switch {
+          text-align: center;
+          margin-top: 1.5rem;
+          color: var(--text-secondary);
+        }
+        .auth-switch button {
+          background: none;
+          border: none;
+          color: var(--primary);
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .auth-error {
+          background: #fee;
+          color: var(--danger);
+          padding: 0.75rem;
+          border-radius: 8px;
+          text-align: center;
+          font-size: 0.9rem;
+        }
+        .logout-btn {
+          background: none;
+          border: 1px solid var(--border);
+          padding: 0.5rem 1rem;
+          border-radius: 8px;
+          cursor: pointer;
+          font-size: 0.9rem;
+          color: var(--text-secondary);
+          margin-right: 0.5rem;
+        }
+        .logout-btn:hover {
+          background: var(--bg-tertiary);
+        }
+        .user-email {
+          font-size: 0.85rem;
+          color: var(--text-secondary);
+          margin-right: 1rem;
+        }
       `}</style>
 
+      {/* AUTH LOADING */}
+      {authLoading && (
+        <div className="auth-container">
+          <div className="auth-box" style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: '2rem', marginBottom: '1rem' }}>🏊‍♂️</div>
+            <div>Loading...</div>
+          </div>
+        </div>
+      )}
+
+      {/* LOGIN/SIGNUP FORM */}
+      {!authLoading && !user && (
+        <div className="auth-container">
+          <div className="auth-box">
+            <div className="auth-title">🏊‍♂️ IronCoach</div>
+            <div className="auth-subtitle">
+              {authMode === 'login' ? 'Welcome back' : 'Create your account'}
+            </div>
+            
+            {authError && <div className="auth-error">{authError}</div>}
+            
+            <form className="auth-form" onSubmit={authMode === 'login' ? handleLogin : handleSignup}>
+              <input
+                type="email"
+                className="auth-input"
+                placeholder="Email"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                required
+              />
+              <input
+                type="password"
+                className="auth-input"
+                placeholder="Password"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                required
+                minLength={6}
+              />
+              <button type="submit" className="auth-btn">
+                {authMode === 'login' ? 'Sign In' : 'Create Account'}
+              </button>
+            </form>
+            
+            <div className="auth-switch">
+              {authMode === 'login' ? (
+                <>Don't have an account? <button onClick={() => setAuthMode('signup')}>Sign up</button></>
+              ) : (
+                <>Already have an account? <button onClick={() => setAuthMode('login')}>Sign in</button></>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MAIN APP - only shown when logged in */}
+      {!authLoading && user && (
+      <>
       <div className="main-container">
         <div className="header">
           <h1>🏊‍♂️ IronCoach</h1>
-          <button 
-            className="settings-btn"
-            onClick={() => setShowSettings(true)}
-            title="Settings"
-          >
-            ⚙️
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <span className="user-email">{user.email}</span>
+            <button className="logout-btn" onClick={handleLogout}>Logout</button>
+            <button 
+              className="settings-btn"
+              onClick={() => setShowSettings(true)}
+              title="Settings"
+            >
+              ⚙️
+            </button>
+          </div>
         </div>
 
         <div className="hero-section">
@@ -2707,6 +3007,8 @@ const [isAnalyzing, setIsAnalyzing] = useState(false);
           </div>
         </div>
       </div>
+    )}
+    </>
     )}
     </>
   );
